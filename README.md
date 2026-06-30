@@ -104,9 +104,11 @@ struct gpu_device_metrics {
     __u64 timestamp_ns;
     __u32 sm_util_pct;        /* 0-100 */
     __u32 mem_util_pct;       /* 0-100 */
-    __u64 mem_total;
-    __u64 mem_used;
-    __u64 mem_reserved;       /* driver overhead */
+    __u64 mem_total;          /* total physical VRAM (bytes) */
+    __u64 mem_used;           /* user-allocated VRAM (bytes); excludes mem_reserved.
+                                 mem_free = mem_total - mem_used - mem_reserved.
+                                 Matches nvidia-smi memory.used. */
+    __u64 mem_reserved;       /* driver/firmware overhead (bytes) */
     __u32 temp_c;
     __u32 power_mw;           /* milliwatts */
     __u32 sm_clock_mhz;
