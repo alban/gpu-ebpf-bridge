@@ -6,9 +6,10 @@
 //   - CGO is disabled (CGO_ENABLED=0), or
 //   - The 'nvml' build tag is not set.
 //
-// In both cases the bridge cannot link against libnvidia-ml.so.1, so we
-// return ErrNotAvailable. The bridge's --mode=auto path treats that as
-// "fall back to mock"; --mode=real treats it as a fatal startup error.
+// In both cases the bridge cannot link against libnvidia-ml.so.1, so
+// newRealPoller returns an error. The bridge's --mode=auto path
+// translates that into "fall back to mock"; --mode=real treats it as
+// a fatal startup error with a clear message.
 
 package main
 
