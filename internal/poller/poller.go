@@ -127,61 +127,147 @@ func (p *Poller) tick(ctx context.Context) error {
 		p.logger.Warn("ProcessSamples failed", "err", sampErr)
 	}
 
-	// Group samples by PID for the aggregated map; write detailed
-	// entries one-by-one.
+	// NVML's nvmlDeviceGetProcessUtilization returns a rolling window
+	// of samples per device, and within one tick the same (pid, dev)
+	// tuple typically appears multiple times with varying utilization
+	// values. Aggregate same-key samples within the tick before
+	// writing to gpu_per_pid_per_device, taking the max over the
+	// utilization fields so consumers see the busiest moment in the
+	// window (last-write-wins would arbitrarily drop the peaks).
+	type pidDevKey struct {
+		Pid uint32
+		Dev uint32
+	}
+	type perDevAgg struct {
+		ts        uint64
+		usedMem   uint64
+		smMax     uint32
+		memMax    uint32
+		encMax    uint32
+		decMax    uint32
+		migInst   uint8
+	}
+	perDev := make(map[pidDevKey]*perDevAgg)
+
+	// Advance per-device watermark from every observed sample, even
+	// for PIDs we filter out below.
+	for _, s := range samples {
+		p.advanceLastSeen(s.DeviceIndex, s.TimestampNs)
+	}
+
+	for _, s := range samples {
+		// Skip NVML's "unattributed/system" bucket. Pid 0 entries are
+		// driver/kernel-side activity that NVML cannot ascribe to a
+		// userspace process; emitting them into gpu_per_pid would let
+		// consumers wrongly enrich kernel-init-side eBPF events with
+		// nonsensical GPU stats. See nvmlProcessUtilizationSample_t
+		// in <nvml.h>.
+		if s.Pid == 0 {
+			continue
+		}
+
+		key := pidDevKey{Pid: s.Pid, Dev: s.DeviceIndex}
+		a := perDev[key]
+		if a == nil {
+			a = &perDevAgg{
+				ts:      s.TimestampNs,
+				usedMem: s.UsedGpuMemory,
+				migInst: s.MigInstance,
+			}
+			perDev[key] = a
+		}
+		// UsedGpuMemory is a steady-state value (set once per tick by
+		// GetComputeRunningProcesses in the real backend); take any
+		// non-zero seen so memory-only fallback entries don't clobber
+		// utilization entries that happen to have UsedGpuMemory==0.
+		if s.UsedGpuMemory > a.usedMem {
+			a.usedMem = s.UsedGpuMemory
+		}
+		if s.SmUtilPct > a.smMax {
+			a.smMax = s.SmUtilPct
+		}
+		if s.MemUtilPct > a.memMax {
+			a.memMax = s.MemUtilPct
+		}
+		if s.EncUtilPct > a.encMax {
+			a.encMax = s.EncUtilPct
+		}
+		if s.DecUtilPct > a.decMax {
+			a.decMax = s.DecUtilPct
+		}
+		if s.TimestampNs > a.ts {
+			a.ts = s.TimestampNs
+		}
+	}
+
+	// Group per-(pid, dev) aggregates by PID and write both maps.
 	type aggBuilder struct {
 		ts         uint64
 		usedTotal  uint64
 		smMax      uint32
 		memMax     uint32
 		firstDev   uint8
-		multi      bool
-		count      uint8
+		devSet     map[uint8]struct{}
 	}
 	agg := make(map[uint32]*aggBuilder)
 
-	for _, s := range samples {
-		// Detailed per-(pid, dev) entry.
-		detail := pidSampleToMap(s)
-		if err := p.cfg.Bridge.UpdatePerPidPerDevice(s.Pid, s.DeviceIndex, &detail); err != nil {
+	for key, a := range perDev {
+		// Detailed per-(pid, dev) entry, written once per unique key
+		// per tick (no more last-write-wins).
+		detail := maps.PidMetrics{
+			TimestampNs:   a.ts,
+			UsedGpuMemory: a.usedMem,
+			SmUtilPct:     a.smMax,
+			MemUtilPct:    a.memMax,
+			EncUtilPct:    a.encMax,
+			DecUtilPct:    a.decMax,
+			GpuDevice:     uint8(key.Dev),
+			MigInstance:   a.migInst,
+		}
+		if err := p.cfg.Bridge.UpdatePerPidPerDevice(key.Pid, key.Dev, &detail); err != nil {
 			p.logger.Warn("UpdatePerPidPerDevice failed",
-				"pid", s.Pid, "dev", s.DeviceIndex, "err", err)
+				"pid", key.Pid, "dev", key.Dev, "err", err)
 		}
 
 		// Aggregated builder for this PID.
-		b := agg[s.Pid]
+		b := agg[key.Pid]
 		if b == nil {
 			b = &aggBuilder{
-				ts:       s.TimestampNs,
-				firstDev: uint8(s.DeviceIndex),
+				ts:       a.ts,
+				firstDev: uint8(key.Dev),
+				devSet:   make(map[uint8]struct{}),
 			}
-			agg[s.Pid] = b
+			agg[key.Pid] = b
 		}
-		b.usedTotal += s.UsedGpuMemory
-		if s.SmUtilPct > b.smMax {
-			b.smMax = s.SmUtilPct
+		b.usedTotal += a.usedMem
+		if a.smMax > b.smMax {
+			b.smMax = a.smMax
 		}
-		if s.MemUtilPct > b.memMax {
-			b.memMax = s.MemUtilPct
+		if a.memMax > b.memMax {
+			b.memMax = a.memMax
 		}
-		if uint8(s.DeviceIndex) != b.firstDev {
-			b.multi = true
+		b.devSet[uint8(key.Dev)] = struct{}{}
+		if a.ts > b.ts {
+			b.ts = a.ts
 		}
-		b.count++
-		// Advance per-device watermark.
-		p.advanceLastSeen(s.DeviceIndex, s.TimestampNs)
 	}
 
 	for pid, b := range agg {
+		// DeviceCount = number of distinct devices the PID was seen
+		// on (was: number of samples, which exploded for noisy PIDs).
+		devCount := uint8(len(b.devSet))
+		if devCount == 0 {
+			devCount = 1
+		}
 		mapVal := maps.PidMetricsAggregated{
 			TimestampNs:        b.ts,
 			UsedGpuMemoryTotal: b.usedTotal,
 			SmUtilPctMax:       b.smMax,
 			MemUtilPctMax:      b.memMax,
 			GpuDevicePrimary:   b.firstDev,
-			DeviceCount:        b.count,
+			DeviceCount:        devCount,
 		}
-		if b.multi {
+		if devCount > 1 {
 			mapVal.GpuDevicePrimary = maps.DevicePrimaryMulti
 		}
 		if err := p.cfg.Bridge.UpdatePerPid(pid, &mapVal); err != nil {
@@ -254,18 +340,5 @@ func deviceSnapshotToMap(d nvml.DeviceSnapshot) maps.DeviceMetrics {
 		EccUncorrectedTotal: d.EccUncorrectedTotal,
 		FanSpeedPct:         d.FanSpeedPct,
 		ComputeMode:         d.ComputeMode,
-	}
-}
-
-func pidSampleToMap(s nvml.ProcessSample) maps.PidMetrics {
-	return maps.PidMetrics{
-		TimestampNs:   s.TimestampNs,
-		UsedGpuMemory: s.UsedGpuMemory,
-		SmUtilPct:     s.SmUtilPct,
-		MemUtilPct:    s.MemUtilPct,
-		EncUtilPct:    s.EncUtilPct,
-		DecUtilPct:    s.DecUtilPct,
-		GpuDevice:     uint8(s.DeviceIndex),
-		MigInstance:   s.MigInstance,
 	}
 }

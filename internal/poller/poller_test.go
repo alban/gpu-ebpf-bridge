@@ -161,7 +161,161 @@ func TestPollerWritesMockDataToMaps(t *testing.T) {
 	if err := pddMap.Lookup(&firstKey, &pd); err != nil {
 		t.Errorf("per_pid_per_device first lookup: %v", err)
 	}
-	if pd.UsedGpuMemory == 0 {
-		t.Errorf("per_pid_per_device first entry has zero UsedGpuMemory")
+}
+
+// TestPollerAggregatesAndFiltersRealisticNvmlNoise drives the poller
+// with a tiny in-test source that returns the kind of noisy output
+// the real NVML backend exhibits in practice:
+//   - pid 0 appearing multiple times per tick (NVML "unattributed
+//     work" bucket)
+//   - the same (pid, dev) appearing multiple times per tick with
+//     varying SM utilization (NVML rolling-window samples)
+// The poller must:
+//   1. drop all pid 0 entries from gpu_per_pid* maps
+//   2. fold duplicates and report the max SM/mem
+//   3. set DeviceCount to the number of distinct devices, not the
+//      number of underlying samples.
+func TestPollerAggregatesAndFiltersRealisticNvmlNoise(t *testing.T) {
+	requireRoot(t)
+
+	pinDir := pinDirForTest(t)
+	bridge, err := maps.Open(pinDir)
+	if err != nil {
+		t.Fatalf("maps.Open: %v", err)
 	}
+	t.Cleanup(func() { _ = bridge.Unpin(); _ = bridge.Close() })
+
+	src := &fakeNvml{
+		devs: []nvml.DeviceSnapshot{
+			{Index: 0, TimestampNs: 1, MemTotal: 80 << 30, SmUtilPct: 7},
+			{Index: 1, TimestampNs: 1, MemTotal: 80 << 30, SmUtilPct: 0},
+		},
+		samples: []nvml.ProcessSample{
+			// pid 0 (NVML "unattributed") returned 5x — must be dropped.
+			{Pid: 0, DeviceIndex: 0, TimestampNs: 1, SmUtilPct: 1},
+			{Pid: 0, DeviceIndex: 0, TimestampNs: 1, SmUtilPct: 2},
+			{Pid: 0, DeviceIndex: 0, TimestampNs: 1, SmUtilPct: 3},
+			{Pid: 0, DeviceIndex: 1, TimestampNs: 1, SmUtilPct: 0},
+			{Pid: 0, DeviceIndex: 1, TimestampNs: 1, SmUtilPct: 0},
+			// Workload PID on dev 0: three samples, max SM is 8.
+			{Pid: 1000, DeviceIndex: 0, TimestampNs: 1, SmUtilPct: 3, UsedGpuMemory: 2 << 30},
+			{Pid: 1000, DeviceIndex: 0, TimestampNs: 1, SmUtilPct: 8, UsedGpuMemory: 2 << 30},
+			{Pid: 1000, DeviceIndex: 0, TimestampNs: 1, SmUtilPct: 5, UsedGpuMemory: 2 << 30},
+			// Multi-device PID on dev 0 and dev 1.
+			{Pid: 2000, DeviceIndex: 0, TimestampNs: 1, SmUtilPct: 4, UsedGpuMemory: 1 << 30},
+			{Pid: 2000, DeviceIndex: 1, TimestampNs: 1, SmUtilPct: 9, UsedGpuMemory: 3 << 30},
+		},
+	}
+
+	p, err := poller.New(poller.Config{
+		PollInterval: 50 * time.Millisecond,
+		Source:       src,
+		Bridge:       bridge,
+	})
+	if err != nil {
+		t.Fatalf("poller.New: %v", err)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 150*time.Millisecond)
+	defer cancel()
+	if err := p.Run(ctx); err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+
+	perPid, err := ebpf.LoadPinnedMap(filepath.Join(pinDir, maps.MapNamePerPid), nil)
+	if err != nil {
+		t.Fatalf("LoadPinnedMap per_pid: %v", err)
+	}
+	defer perPid.Close()
+
+	// pid 0 must NOT be in the aggregated map.
+	pid0 := uint32(0)
+	var got maps.PidMetricsAggregated
+	if err := perPid.Lookup(&pid0, &got); err == nil {
+		t.Errorf("per_pid[0] should be filtered out, got %+v", got)
+	}
+
+	// Workload PID: 3 samples folded → SmUtilPctMax=8, DeviceCount=1,
+	// UsedGpuMemoryTotal=2 GiB (not summed 3x).
+	pid1000 := uint32(1000)
+	if err := perPid.Lookup(&pid1000, &got); err != nil {
+		t.Fatalf("per_pid[1000] lookup: %v", err)
+	}
+	if got.SmUtilPctMax != 8 {
+		t.Errorf("per_pid[1000].SmUtilPctMax = %d, want 8", got.SmUtilPctMax)
+	}
+	if got.DeviceCount != 1 {
+		t.Errorf("per_pid[1000].DeviceCount = %d, want 1", got.DeviceCount)
+	}
+	if got.UsedGpuMemoryTotal != 2<<30 {
+		t.Errorf("per_pid[1000].UsedGpuMemoryTotal = %d, want %d",
+			got.UsedGpuMemoryTotal, uint64(2<<30))
+	}
+	if got.GpuDevicePrimary != 0 {
+		t.Errorf("per_pid[1000].GpuDevicePrimary = %d, want 0", got.GpuDevicePrimary)
+	}
+
+	// Multi-device PID: SmUtilPctMax=9, DeviceCount=2,
+	// UsedGpuMemoryTotal=4 GiB, GpuDevicePrimary=DevicePrimaryMulti.
+	pid2000 := uint32(2000)
+	if err := perPid.Lookup(&pid2000, &got); err != nil {
+		t.Fatalf("per_pid[2000] lookup: %v", err)
+	}
+	if got.SmUtilPctMax != 9 {
+		t.Errorf("per_pid[2000].SmUtilPctMax = %d, want 9", got.SmUtilPctMax)
+	}
+	if got.DeviceCount != 2 {
+		t.Errorf("per_pid[2000].DeviceCount = %d, want 2", got.DeviceCount)
+	}
+	if got.UsedGpuMemoryTotal != 4<<30 {
+		t.Errorf("per_pid[2000].UsedGpuMemoryTotal = %d, want %d",
+			got.UsedGpuMemoryTotal, uint64(4<<30))
+	}
+	if got.GpuDevicePrimary != maps.DevicePrimaryMulti {
+		t.Errorf("per_pid[2000].GpuDevicePrimary = 0x%02x, want 0x%02x",
+			got.GpuDevicePrimary, maps.DevicePrimaryMulti)
+	}
+
+	// pid 0 must also not appear in per_pid_per_device.
+	perPidDev, err := ebpf.LoadPinnedMap(filepath.Join(pinDir, maps.MapNamePerPidPerDevice), nil)
+	if err != nil {
+		t.Fatalf("LoadPinnedMap per_pid_per_device: %v", err)
+	}
+	defer perPidDev.Close()
+	pid0dev0 := maps.PerPidPerDeviceKey(0, 0)
+	var pd maps.PidMetrics
+	if err := perPidDev.Lookup(&pid0dev0, &pd); err == nil {
+		t.Errorf("per_pid_per_device[0, 0] should be filtered, got %+v", pd)
+	}
+
+	// Workload (pid 1000, dev 0): SmUtilPct=8 (max), not 5 (last sample).
+	pid1000dev0 := maps.PerPidPerDeviceKey(1000, 0)
+	if err := perPidDev.Lookup(&pid1000dev0, &pd); err != nil {
+		t.Fatalf("per_pid_per_device[1000, 0] lookup: %v", err)
+	}
+	if pd.SmUtilPct != 8 {
+		t.Errorf("per_pid_per_device[1000,0].SmUtilPct = %d, want 8 (max, not last)",
+			pd.SmUtilPct)
+	}
+	if pd.UsedGpuMemory != 2<<30 {
+		t.Errorf("per_pid_per_device[1000,0].UsedGpuMemory = %d, want %d",
+			pd.UsedGpuMemory, uint64(2<<30))
+	}
+}
+
+// fakeNvml is a tiny test-local Poller that returns a fixed set of
+// devices and process samples on every tick. Unlike nvml.Mock it does
+// not synthesise data; tests put exactly the noise pattern they want
+// to exercise into the slices and assert what the poller does with it.
+type fakeNvml struct {
+	devs    []nvml.DeviceSnapshot
+	samples []nvml.ProcessSample
+}
+
+func (f *fakeNvml) Init(context.Context) error { return nil }
+func (f *fakeNvml) Close() error               { return nil }
+func (f *fakeNvml) Devices(context.Context) ([]nvml.DeviceSnapshot, error) {
+	return append([]nvml.DeviceSnapshot(nil), f.devs...), nil
+}
+func (f *fakeNvml) ProcessSamples(context.Context, uint64) ([]nvml.ProcessSample, error) {
+	return append([]nvml.ProcessSample(nil), f.samples...), nil
 }
