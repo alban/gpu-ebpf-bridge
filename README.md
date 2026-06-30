@@ -34,6 +34,7 @@ flowchart LR
     subgraph consumers["any eBPF consumer"]
         direction TB
         ig[Inspektor Gadget gadget]
+        dump["gpu-ebpf-bridge --dump<br/>(built-in, no extra deps)"]
         bpftool["bpftool — ad-hoc inspection"]
         libbpfTool[libbpf C tool]
         ce[cilium/ebpf Go tool]
@@ -211,11 +212,37 @@ All NVML calls are wrapped in a `safe()` helper that tolerates `NVML_ERROR_NOT_S
 
 ## Consumers
 
-The bridge is consumer-agnostic. Anything that can `bpf(BPF_OBJ_GET, "/sys/fs/bpf/gpu_*", ...)` can read its data. Recipes below in roughly increasing order of effort: start with `bpftool` for inspection, graduate to Inspektor Gadget for per-event enrichment, write custom Go/C consumers for anything more involved.
+The bridge is consumer-agnostic. Anything that can `bpf(BPF_OBJ_GET, "/sys/fs/bpf/gpu_*", ...)` can read its data. Recipes below in roughly increasing order of effort: start with `gpu-ebpf-bridge --dump` (or `bpftool`) for inspection, graduate to Inspektor Gadget for per-event enrichment, write custom Go/C consumers for anything more involved.
 
-### `bpftool` — ad-hoc inspection (the recommended starting point)
+### `gpu-ebpf-bridge --dump` — built-in inspection (no external dependencies)
 
-`bpftool` reads BTF natively from pinned maps, so every field is decoded by name with no struct declaration on your side. This is the right tool for any "what's in the map right now?" question.
+The bridge binary itself can pretty-print the pinned maps. This is the right starting point on hosts (or container images) where `bpftool` is not installed, e.g. fresh Azure/AWS GPU VMs or the stock Inspektor Gadget Docker image.
+
+```sh
+# Show the current contents of all four maps
+sudo gpu-ebpf-bridge --dump
+
+# Example output:
+# # gpu_meta
+#   {SchemaVersion:1 N_devices:1 LastUpdateNs:178281854094... HelperPid:12345 _Reserved:0}
+#
+# # gpu_device
+#   [device 0] {TimestampNs:... SmUtilPct:71 MemUtilPct:53 MemTotal:85899345920 ...}
+#
+# # gpu_per_pid
+#   [pid 100000] {... UsedGpuMemoryTotal:268435456 SmUtilPctMax:38 ...}
+#
+# # gpu_per_pid_per_device
+#   [pid 100001 dev 0] {... UsedGpuMemory:402653184 SmUtilPct:49 ...}
+```
+
+`--dump` does not start the poller; it only opens each map read-only via bpffs and prints the contents using Go's default formatter. It is safe to run alongside a live bridge daemon (`--keep-pins=true` not required — pins exist as long as the bridge is running).
+
+Field names mirror the C structs in `include/gpu_types.h`. For map types and key encoding, see [API contract: the pinned maps](#api-contract-the-pinned-maps).
+
+### `bpftool` — ad-hoc inspection (when available)
+
+`bpftool` reads BTF natively from pinned maps, so every field is decoded by name with no struct declaration on your side and the output is friendly to `jq`. It is the right tool for any "what's in the map right now?" question when it is installed (it is part of `linux-tools-common`/`linux-tools-generic` on Ubuntu, `bpftool` on Fedora, and ships with most modern kernel-tools packages — but is _not_ in the stock Inspektor Gadget Docker image).
 
 ```sh
 # Full dump of per-device metrics, every field labeled by name
@@ -254,7 +281,7 @@ sudo bpftool map dump pinned /sys/fs/bpf/gpu_device --json --pretty \
               else "other (\(.))" end'
 ```
 
-bpftool is the recommended workflow for: debugging the bridge, ad-hoc PID lookups, building shell-script integrations, and verifying the bridge's data before writing a real gadget.
+bpftool is also useful for: debugging the bridge, ad-hoc PID lookups, building shell-script integrations, and verifying the bridge's data before writing a real gadget. If `bpftool` is not available on the host, use `gpu-ebpf-bridge --dump` (above) for the same purpose with slightly less polish.
 
 ### bpftrace
 
@@ -262,7 +289,7 @@ bpftrace **cannot consume externally-pinned BPF maps as of v0.21**. The existing
 
 **Workarounds today:**
 
-- For ad-hoc inspection: use `bpftool map dump` (above) or shell out via `system()` in a bpftrace script.
+- For ad-hoc inspection: use `gpu-ebpf-bridge --dump` or `bpftool map dump` (above) or shell out via `system()` in a bpftrace script.
 - For continuous correlation with kernel events: write a small consumer with cilium/ebpf (Go) or libbpf (C) — see below.
 
 **Adding bpftrace support is tractable but not trivial.** A minimum-viable patch is on the order of ~140 lines:
@@ -279,18 +306,18 @@ With that MVP, a bpftrace script that declares `@gpu_per_pid` of compatible type
 
 Two patterns commonly combined:
 
-#### A. Pure ad-hoc inspection from the `ig` CLI
+#### A. Pure ad-hoc inspection from the host
 
-If you just want to see what the bridge is publishing, no custom gadget needed — IG bundles `bpftool` functionality and a tiny `iter`-style gadget can dump a pinned map. The simplest workflow stays on the command line:
+If you just want to see what the bridge is publishing, no custom gadget needed — just run `gpu-ebpf-bridge --dump` on the host (see [above](#gpu-ebpf-bridge---dump--built-in-inspection-no-external-dependencies)). Note that `bpftool` is **not** in the standard IG container image, so `docker exec ig bpftool ...` will not work; either install `bpftool` on the host and run it there, or use the bridge's built-in `--dump`.
 
 ```sh
-# Bridge running on the host, bpffs shared with the IG container.
-# Inspect from inside the IG container:
-docker exec ig bpftool map dump pinned /sys/fs/bpf/gpu_device --json --pretty
-docker exec ig bpftool map dump pinned /sys/fs/bpf/gpu_per_pid --json --pretty
+# On the host (bpffs is shared between host and IG container by virtue of
+# the bind-mount /sys/fs/bpf -> /host/sys/fs/bpf in the IG container, so
+# inspecting from the host is equivalent to inspecting from inside IG):
+sudo gpu-ebpf-bridge --dump
 ```
 
-(`bpftool` ships in the standard IG image.)
+For per-event enrichment from inside Inspektor Gadget (so the GPU data gets attached to every event a gadget emits, not just printed once), see "Custom gadget" below.
 
 #### B. Custom gadget that enriches its own events
 
@@ -463,7 +490,12 @@ sudo ./gpu-ebpf-bridge --poll-interval=200ms
 
 # Verbose
 sudo ./gpu-ebpf-bridge --log-level=debug
+
+# Dump the current contents of the pinned maps and exit (no poller)
+sudo ./gpu-ebpf-bridge --dump
 ```
+
+See [`gpu-ebpf-bridge --dump`](#gpu-ebpf-bridge---dump--built-in-inspection-no-external-dependencies) for the inspection workflow.
 
 ### Container
 
