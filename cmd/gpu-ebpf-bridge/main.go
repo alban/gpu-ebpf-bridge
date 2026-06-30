@@ -31,6 +31,7 @@ type options struct {
 	keepPins     bool
 	logLevel     string
 	showVersion  bool
+	dump         bool
 }
 
 func parseFlags(args []string) (options, error) {
@@ -47,6 +48,9 @@ func parseFlags(args []string) (options, error) {
 	fs.StringVar(&opt.logLevel, "log-level", "info",
 		"Logger level: debug, info, warn, error")
 	fs.BoolVar(&opt.showVersion, "version", false, "Print version and exit")
+	fs.BoolVar(&opt.dump, "dump", false,
+		"Read the bpffs-pinned bridge maps and print their contents, then exit. "+
+			"Useful as a bpftool-free debugging aid; does not start the poller.")
 	if err := fs.Parse(args); err != nil {
 		return options{}, err
 	}
@@ -134,6 +138,9 @@ func run(args []string) error {
 	if opt.showVersion {
 		fmt.Printf("gpu-ebpf-bridge %s\n", version())
 		return nil
+	}
+	if opt.dump {
+		return runDump(opt.pinDir)
 	}
 
 	logger := newLogger(opt.logLevel)
