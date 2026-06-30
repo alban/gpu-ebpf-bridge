@@ -1,44 +1,57 @@
 # gpu_hold — synthetic CUDA workload for bridge per-PID tests
 
-A 130-line PyTorch script that allocates GPU memory and runs periodic
-matrix multiplies. Use it to populate the bridge's `gpu_per_pid` /
-`gpu_per_pid_per_device` maps when no real CUDA workload is available
-(e.g. when validating the bridge or a consumer gadget on a fresh GPU
-VM).
+Allocates a chunk of VRAM and (optionally) drives the SMs with a busy
+kernel, so the bridge populates `gpu_per_pid` and
+`gpu_per_pid_per_device` with realistic data. Use it to validate the
+bridge or any consumer gadget without a real CUDA workload at hand.
 
-## Prerequisites
+Two equivalent implementations are provided. Pick whichever is least
+painful given what's already on the host:
 
-- NVIDIA driver + CUDA runtime on the host (the bridge needs these
-  too, so if the bridge runs in `--mode=real` you already have them).
-- PyTorch with CUDA support:
+| Implementation        | File              | Extra install                            | Disk |
+|-----------------------|-------------------|------------------------------------------|------|
+| C / CUDA (recommended)| `gpu_hold.cu`     | none (uses the toolchain you already have)| ~50 KiB |
+| Python (PyTorch)      | `gpu_hold.py`     | `pip install torch` (with CUDA wheel)    | ~3 GiB |
 
-  ```sh
-  pip install --break-system-packages torch
-  ```
+Both honour the same env vars; see source comments for the full list.
 
-  Other CUDA Python packages (`cuda-python`, `cupy`, `numba`) work too
-  but require slightly different code. PyTorch is the easiest because
-  most GPU VM images already have it.
+## Option A: nvcc-compiled C/CUDA (no extra deps)
 
-## Run
+The CUDA toolkit is already required to install the NVIDIA driver, so
+`nvcc` is normally available on a GPU host. If `which nvcc` finds it,
+this is the right path.
 
 ```sh
-# Defaults: 2 GiB VRAM + periodic 4096x4096 matmul for 120 s.
-python3 gpu_hold.py
+cd examples/workloads/gpu_hold
+make                       # nvcc -O2 -o gpu_hold gpu_hold.cu
 
-# 4 GiB for 5 minutes
+./gpu_hold                 # 2 GiB + busy kernel for 120 s
+GPU_HOLD_MIB=4096 GPU_HOLD_SECONDS=300 ./gpu_hold
+GPU_HOLD_COMPUTE=0 ./gpu_hold    # memory hold only, no SM activity
+```
+
+If `nvcc` is missing but the CUDA libs are present, install just the
+toolkit (Ubuntu: `apt install nvidia-cuda-toolkit`); no full SDK
+needed.
+
+## Option B: PyTorch (Python)
+
+```sh
+pip install --break-system-packages torch
+python3 examples/workloads/gpu_hold/gpu_hold.py
+
+# Same env vars as the C version
 GPU_HOLD_MIB=4096 GPU_HOLD_SECONDS=300 python3 gpu_hold.py
-
-# Memory-only (no compute) — useful to test that mem_used / per-PID
-# memory accounting works without the noise of utilization.
 GPU_HOLD_COMPUTE=0 python3 gpu_hold.py
 ```
 
-All env vars are documented at the top of `gpu_hold.py`.
+The torch wheel with CUDA support is ~3 GiB. On disk-constrained
+hosts, use Option A instead — or run `pip cache purge` before retrying
+if a previous install left partial downloads in `~/.cache/pip`.
 
 ## Verify against the bridge
 
-In another shell while `gpu_hold.py` is running:
+In another shell while the workload is running:
 
 ```sh
 # Bridge maps (built-in inspector, no bpftool required).
@@ -48,21 +61,23 @@ sudo ~/gpu-ebpf-bridge/bin/gpu-ebpf-bridge-nvml --dump
 nvidia-smi --query-compute-apps=pid,used_memory --format=csv
 nvidia-smi --query-gpu=utilization.gpu,memory.used --format=csv,nounits
 
-# gpu_top gadget (requires Inspektor Gadget + the alban_map_pinning_and_iter branch).
+# gpu_top gadget (requires IG + the alban_map_pinning_and_iter branch).
 sudo ig run gpu_top:alban_map_pinning_and_iter --verify-image=false \
      --timeout=2 -o json | jq .
 ```
 
-Expected in `--dump`:
+Expected in `--dump` while `gpu_hold` is running:
 
-- `# gpu_per_pid` shows your `pid` with non-zero `UsedGpuMemoryTotal`
-  and (if `GPU_HOLD_COMPUTE=1`) non-zero `SmUtilPctMax`.
-- `# gpu_per_pid_per_device` shows the same `pid` with `Dev=0`.
-- `# gpu_device[0]` shows non-zero `MemUsed` and (if compute is on)
+- `# gpu_per_pid` has an entry keyed by the workload's PID with
+  `UsedGpuMemoryTotal > 0` and (if `GPU_HOLD_COMPUTE=1`)
+  `SmUtilPctMax > 0`.
+- `# gpu_per_pid_per_device` has the same PID with `Dev=0`.
+- `# gpu_device[0]` shows non-zero `MemUsed` and (with compute on)
   non-zero `SmUtilPct`.
 
-If the bridge `--dump` is empty for `gpu_per_pid` but the workload is
-clearly running (nvidia-smi shows it), the most common cause is that
-NVML's `GetProcessUtilization` / `GetComputeRunningProcesses` is
+If `gpu_per_pid` stays empty even though `nvidia-smi
+--query-compute-apps` lists the PID, the most common cause is NVML's
+`GetProcessUtilization` / `GetComputeRunningProcesses` being
 restricted on the SKU (Azure vGPU profiles sometimes hide other
 tenants' processes; this is documented in the NVML docs).
+
